@@ -67,13 +67,22 @@
       </div>
       <div id="partitions" class="partitions" hidden>
         <h3>分区（4 KiB LBA）</h3>
+        <p class="hint">
+          勾选一个分区即可下载只含该分区的独立 4Kn 镜像：保留字节位置、内容、
+          类型 GUID、属性与名称，为新盘和分区各生成一个新 GUID，重建保护 MBR
+          与主备 GPT（备 GPT 紧接分区末尾），其余字节全部为零。
+        </p>
         <div class="table-scroll">
           <table>
             <thead>
-              <tr><th>#</th><th>名称</th><th>类型 GUID</th><th>唯一 GUID</th><th>起始 LBA</th><th>结束 LBA</th><th>字节数</th></tr>
+              <tr><th>导出</th><th>#</th><th>名称</th><th>类型 GUID</th><th>唯一 GUID（源盘）</th><th>起始 LBA</th><th>结束 LBA</th><th>字节数</th></tr>
             </thead>
             <tbody id="partitions-body"></tbody>
           </table>
+        </div>
+        <div id="export-bar" class="export-bar" hidden>
+          <span id="export-info" class="hint"></span>
+          <a id="export-link" class="primary as-button" download>导出所选分区（4Kn RAW）</a>
         </div>
       </div>
       <div id="download-wrap" class="download-wrap" hidden>

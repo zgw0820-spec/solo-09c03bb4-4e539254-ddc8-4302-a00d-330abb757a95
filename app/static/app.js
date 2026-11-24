@@ -8,6 +8,7 @@ const state = {
   jobId: null,
   timer: null,
   sampleFiles: new Map(),
+  selectedPartition: null,
 };
 
 const STATUS_TEXT = {
@@ -73,6 +74,7 @@ function resetUI() {
   if (state.timer) clearInterval(state.timer);
   state.timer = null;
   state.jobId = null;
+  state.selectedPartition = null;
   $("report-card").hidden = true;
   $("progress-wrap").hidden = true;
   $("checks").hidden = true;
@@ -81,6 +83,7 @@ function resetUI() {
   $("warnings").hidden = true;
   $("copies").replaceChildren();
   $("meta").replaceChildren();
+  $("export-bar").hidden = true;
   hideBanner();
 }
 
@@ -257,11 +260,11 @@ function renderJob(job) {
 
   if (job.status === "failed" && job.error) {
     renderFailure(job.error);
-    if (summary) renderSummary(summary);
+    if (summary) renderSummary(summary, job.status, job.source_name);
     return;
   }
 
-  if (summary) renderSummary(summary);
+  if (summary) renderSummary(summary, job.status, job.source_name);
 
   const checks = job.checks || [];
   if (job.status === "done" && checks.length) {
@@ -281,7 +284,7 @@ function renderJob(job) {
   }
 }
 
-function renderSummary(summary) {
+function renderSummary(summary, status, sourceName) {
   const meta = $("meta");
   meta.replaceChildren();
   const rows = [
@@ -350,9 +353,31 @@ function renderSummary(summary) {
     return;
   }
   wrap.hidden = false;
+  const selectable = (status === "done");
+  if (!selectable) $("export-bar").hidden = true;
+  if (selectable) {
+    const wanted = state.selectedPartition;
+    if (!summary.partitions.some((p) => p.index === wanted)) {
+      state.selectedPartition = summary.partitions[0].index;
+    }
+  }
   for (const part of summary.partitions) {
+    const cell = el("td");
+    if (selectable && part.export) {
+      const radio = el("input", {
+        type: "radio",
+        name: "partition-select",
+        value: String(part.index),
+      });
+      radio.checked = part.index === state.selectedPartition;
+      radio.addEventListener("change", () => selectPartition(part, sourceName));
+      cell.append(radio);
+    } else {
+      cell.append(document.createTextNode("—"));
+    }
     body.append(
       el("tr", {}, [
+        cell,
         el("td", { text: String(part.index) }),
         el("td", { text: part.name || "（无名称）" }),
         el("td", { class: "mono", text: part.type_guid }),
@@ -363,6 +388,29 @@ function renderSummary(summary) {
       ])
     );
   }
+  if (selectable) {
+    const chosen = summary.partitions.find((p) => p.index === state.selectedPartition);
+    if (chosen) selectPartition(chosen, sourceName);
+  }
+}
+
+function selectPartition(part, sourceName) {
+  state.selectedPartition = part.index;
+  const info = part.export;
+  const bar = $("export-bar");
+  if (!info) {
+    bar.hidden = true;
+    return;
+  }
+  const link = $("export-link");
+  const base = (sourceName || "disk.img").replace(/\.img$/i, "");
+  link.href = part.export_url;
+  link.setAttribute("download", `${base}-part${part.index}.4k.img`);
+  link.hidden = false;
+  $("export-info").textContent =
+    `分区 ${part.index}（${part.name || "无名称"}）· 独立镜像 ${formatBytes(info.export_size)} · ` +
+    `新盘 GUID ${info.disk_guid} · 新分区 GUID ${info.partition_guid}`;
+  bar.hidden = false;
 }
 
 async function loadSample(btn) {

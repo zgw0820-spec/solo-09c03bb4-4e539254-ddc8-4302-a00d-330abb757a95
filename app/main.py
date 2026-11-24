@@ -17,6 +17,7 @@ from starlette.datastructures import UploadFile
 
 from .config import Settings, settings as default_settings
 from .errors import ConversionError
+from .export import ExportResponse, RangeNotSatisfiable
 from .jobs import Job, make_job_manager
 from .samples import SAMPLES_BY_KEY, SampleCache
 
@@ -334,6 +335,80 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             filename=filename,
             headers={"X-Content-Type-Options": "nosniff"},
         )
+
+    @app.get("/api/jobs/{job_id}/partitions/{partition_index}")
+    async def partition_export_info(job_id: str, partition_index: str):
+        if not partition_index.isdigit():
+            return error_response(
+                ConversionError(
+                    "PARTITION_NOT_FOUND", "分区编号无效。", status_code=404
+                )
+            )
+        job: Job | None = manager.get(job_id)
+        if job is None:
+            return error_response(
+                ConversionError(
+                    "JOB_NOT_FOUND",
+                    "找不到该任务，可能已过期或被删除。",
+                    status_code=404,
+                )
+            )
+        info = job.export_info(int(partition_index))
+        if info is None:
+            return error_response(
+                ConversionError(
+                    "PARTITION_NOT_FOUND",
+                    f"源盘没有编号为 {partition_index} 的分区。",
+                    status_code=404,
+                )
+            )
+        info["download_url"] = (
+            f"/api/jobs/{job_id}/partitions/{partition_index}/export"
+        )
+        return JSONResponse(info)
+
+    @app.api_route(
+        "/api/jobs/{job_id}/partitions/{partition_index}/export",
+        methods=["GET", "HEAD"],
+    )
+    async def export_partition(job_id: str, partition_index: str, request: Request):
+        if not partition_index.isdigit():
+            return error_response(
+                ConversionError(
+                    "PARTITION_NOT_FOUND", "分区编号无效。", status_code=404
+                )
+            )
+        try:
+            source = manager.open_export(job_id, int(partition_index))
+        except ConversionError as exc:
+            return error_response(exc)
+
+        # The export plan is derived only from the job and the partition index,
+        # so any Range request can be answered independently: no per-download
+        # state exists and repeated requests stitch back to the full image.
+        # The bytes are streamed from the original product; nothing is written.
+        try:
+            return ExportResponse(
+                source,
+                range_header=request.headers.get("range"),
+                filename=source.filename,
+                extra_headers=source.plan.metadata_headers(),
+            )
+        except RangeNotSatisfiable as exc:
+            return JSONResponse(
+                status_code=416,
+                content={
+                    "error": {
+                        "code": "RANGE_NOT_SATISFIABLE",
+                        "message": "请求的字节范围超出导出镜像。",
+                        "details": {"export_size": exc.size},
+                    }
+                },
+                headers={"Content-Range": f"bytes */{exc.size}"},
+            )
+        except Exception:
+            source.close()
+            raise
 
     return app
 

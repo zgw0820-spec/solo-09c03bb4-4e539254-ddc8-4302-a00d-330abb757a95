@@ -27,11 +27,25 @@ from .converter import (
     verify_output,
 )
 from .errors import ConversionError, VerificationError
+from .export import (
+    ExportPlan,
+    ExportSource,
+    plan_partition_export,
+)
 
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 META_NAME = "job.json"
 SOURCE_NAME = "source.img"
 OUTPUT_NAME = "output-4k.img"
+
+
+def _export_filename(source_name: str | None, partition_index: int) -> str:
+    stem = (source_name or "disk.img").replace("\\", "/").rsplit("/", 1)[-1].strip()
+    stem = "".join(ch for ch in stem if ch.isprintable() and ch not in '"')
+    if stem.lower().endswith(".img"):
+        stem = stem[:-4]
+    stem = stem[:100] or "disk"
+    return f"{stem}-part{partition_index}.4k.img"
 
 
 @dataclass
@@ -48,6 +62,7 @@ class Job:
     error: dict[str, Any] | None = None
     source_name: str | None = None
     cancel: threading.Event = field(default_factory=threading.Event)
+    discarded: bool = False
 
     @property
     def source_path(self) -> Path:
@@ -56,6 +71,16 @@ class Job:
     @property
     def output_path(self) -> Path:
         return self.dir / OUTPUT_NAME
+
+    def export_info(self, partition_index: int) -> dict[str, Any] | None:
+        """Plan metadata for one partition export, or ``None`` if unavailable."""
+        if self.analysis is None:
+            return None
+        try:
+            plan = plan_partition_export(self.id, self.analysis, partition_index)
+        except ConversionError:
+            return None
+        return plan.metadata()
 
     def summary(self) -> dict[str, Any] | None:
         a = self.analysis
@@ -88,6 +113,8 @@ class Job:
                     "end_lba_4k": (p.end_lba + 1) // 8 - 1,
                     "byte_start": p.start_lba * a.sector_size,
                     "byte_end_exclusive": (p.end_lba + 1) * a.sector_size,
+                    "export_url": f"/api/jobs/{self.id}/partitions/{p.index}/export",
+                    "export": self.export_info(p.index),
                 }
                 for p in a.partitions
             ],
@@ -130,6 +157,11 @@ class JobManager:
         self._lock = threading.RLock()
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._stop = threading.Event()
+        # Number of exports currently streaming per job.  A job directory is
+        # kept on disk while an export is in flight, even after the job has
+        # been deleted from the in-memory table or expired.
+        self._active_exports: dict[str, int] = {}
+        self._pending_cleanup: dict[str, Job] = {}
         self._workers = [
             threading.Thread(
                 target=self._worker, name=f"migrate-worker-{i}", daemon=True
@@ -176,6 +208,8 @@ class JobManager:
             return
         with self._lock:
             active = set(self._jobs)
+            active.update(self._active_exports)
+            active.update(self._pending_cleanup)
         cutoff = time.time() - self.job_ttl_seconds
         for child in self.work_dir.iterdir():
             if not child.is_dir() or not JOB_ID_RE.match(child.name):
@@ -245,9 +279,119 @@ class JobManager:
     def discard(self, job_id: str) -> None:
         with self._lock:
             job = self._jobs.pop(job_id, None)
+            if job is not None:
+                # Stop the worker from (re)creating files in this directory.
+                job.discarded = True
+            active = self._active_exports.get(job_id, 0)
+            if job is not None and active > 0:
+                # An export is still streaming from this directory.  Keep it
+                # until that transfer finishes; the open file descriptor would
+                # survive an unlink, but deferring also keeps the on-disk
+                # cleanup atomic and portable.
+                self._pending_cleanup[job_id] = job
+                job = None
         if job is not None:
             job.cancel.set()
-            shutil.rmtree(job.dir, ignore_errors=True)
+            self._remove_job_dir(job)
+
+    @staticmethod
+    def _remove_job_dir(job: Job) -> None:
+        for _ in range(5):
+            try:
+                shutil.rmtree(job.dir)
+                return
+            except FileNotFoundError:
+                return
+            except OSError:
+                # A concurrent meta write may still be settling; retry briefly.
+                time.sleep(0.02)
+        shutil.rmtree(job.dir, ignore_errors=True)
+
+    # -- partition export --------------------------------------------------
+
+    def open_export(
+        self, job_id: str, partition_index: int, *, chunk_size: int | None = None
+    ) -> ExportSource:
+        """Pin the produced image and prepare a streaming partition export.
+
+        The returned source owns a file descriptor; callers must close it (the
+        HTTP response does so when the transfer ends).  Raises
+        :class:`ConversionError` with the job-level error codes used by the
+        download endpoint.
+        """
+        job = self.get(job_id)
+        if job is None:
+            raise ConversionError(
+                "JOB_NOT_FOUND",
+                "找不到该任务，可能已过期或被删除。",
+                status_code=404,
+            )
+        if job.status != "done" or job.error is not None:
+            raise ConversionError(
+                "NOT_READY",
+                "任务尚未完成或未通过复验，暂不可导出分区。",
+                status_code=409,
+            )
+        if job.analysis is None:
+            raise ConversionError(
+                "EXPORT_UNAVAILABLE",
+                "任务缺少源盘分析结果，无法导出分区。",
+                status_code=409,
+            )
+        try:
+            fd = os.open(job.output_path, os.O_RDONLY)
+        except FileNotFoundError:
+            raise ConversionError(
+                "OUTPUT_MISSING", "成品文件已不存在（可能已过期）。", status_code=410
+            ) from None
+        try:
+            plan: ExportPlan = plan_partition_export(
+                job.id, job.analysis, partition_index
+            )
+            expected = job.analysis.disk_size
+            actual = os.fstat(fd).st_size
+            if actual != expected:
+                raise ConversionError(
+                    "OUTPUT_MISSING",
+                    "成品文件长度异常，无法导出分区。",
+                    status_code=410,
+                )
+            # Record the in-flight export before releasing the lock, but only
+            # while the job is still registered: discard() may run between the
+            # pop and this block, in which case the directory is already gone
+            # and a new export must not be admitted.
+            name = _export_filename(job.source_name, partition_index)
+            with self._lock:
+                if self._jobs.get(job.id) is not job:
+                    raise ConversionError(
+                        "JOB_NOT_FOUND",
+                        "找不到该任务，可能已过期或被删除。",
+                        status_code=404,
+                    )
+                self._active_exports[job.id] = self._active_exports.get(job.id, 0) + 1
+            return ExportSource(
+                plan,
+                fd,
+                filename=name,
+                chunk_size=chunk_size or self.chunk_size,
+                on_close=lambda: self.release_export(job.id),
+            )
+        except Exception:
+            os.close(fd)
+            raise
+
+    def release_export(self, job_id: str) -> None:
+        """Drop one in-flight export and finish any deferred directory cleanup."""
+        with self._lock:
+            count = self._active_exports.get(job_id, 0)
+            if count <= 1:
+                self._active_exports.pop(job_id, None)
+                pending = self._pending_cleanup.pop(job_id, None)
+            else:
+                self._active_exports[job_id] = count - 1
+                pending = None
+        if pending is not None:
+            self._remove_job_dir(pending)
 
     # -- reads -------------------------------------------------------------
 
@@ -315,7 +459,7 @@ class JobManager:
                     {"type": type(exc).__name__},
                 )
             finally:
-                if job.status != "done":
+                if job.status != "done" and not job.discarded:
                     job.output_path.unlink(missing_ok=True)
                 self._write_meta(job)
 
@@ -397,6 +541,8 @@ class JobManager:
         self._write_meta(job)
 
     def _write_meta(self, job: Job) -> None:
+        if job.discarded:
+            return
         meta = job.public()
         meta["version"] = 1
         path = job.dir / META_NAME

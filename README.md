@@ -120,8 +120,10 @@ python3 -m pytest -q
 | POST | `/api/jobs` | 上传。支持 `multipart/form-data`（字段 `file`）或裸 `application/octet-stream`（文件名用 `X-Filename`） |
 | GET | `/api/jobs/{id}` | 状态、进度、源盘报告、复验清单 |
 | POST | `/api/jobs/{id}/cancel` | 取消 |
-| DELETE | `/api/jobs/{id}` | 删除任务与文件 |
-| GET | `/api/jobs/{id}/download` | 仅 `done` 且复验通过时可下载 |
+| DELETE | `/api/jobs/{id}` | 删除任务与文件（进行中的分区导出仍可传完） |
+| GET | `/api/jobs/{id}/download` | 仅 `done` 且复验通过时可下载整盘 |
+| GET | `/api/jobs/{id}/partitions/{n}` | 单个分区导出信息（新 GUID、导出长度、下载地址） |
+| GET | `/api/jobs/{id}/partitions/{n}/export` | 流式导出单分区 4Kn 镜像，支持单段 `Range` |
 | GET | `/api/samples` | 样盘目录 |
 | GET | `/api/samples/{key}` | 下载样盘 |
 | GET | `/api/config` | 前端配置 |
@@ -129,6 +131,43 @@ python3 -m pytest -q
 
 错误统一为 `{"error": {"code", "message", "details"}}`，`message` 与
 `details` 为中文说明。
+
+## 单分区导出
+
+结果页的分区表每行有一个单选按钮；选中后点击“导出所选分区（4Kn RAW）”
+（或直接 `GET /api/jobs/{id}/partitions/{n}/export`），得到一份只含该分区的
+独立 **4 KiB 逻辑扇区** GPT 镜像，可直接挂载/启动：
+
+- **保留**：分区字节位置（导出镜像内偏移与原成品相同）、内容（逐字节）、
+  类型 GUID、属性、名称、分区表内序号；
+- **更换**：新盘 GUID 与新分区唯一 GUID 由 `uuid5(命名空间, 任务 id + 分区号 +
+  原盘/原分区 GUID)` 派生，**同一任务同一分区每次导出的值完全一致**，且不
+  等于原来的两个 GUID；
+- **重建**：保护 MBR（单一 `0xEE`，覆盖导出镜像）、主 GPT（LBA 1 + 4 个
+  分区项扇区）、备 GPT（4 个分区项扇区 + 表头，**紧接所选分区末尾**）；
+- **清零**：除主 GPT 保留区、所选分区、备 GPT 保留区之外，其余字节全为零
+  （不复制原盘未分配区域或其它分区）；
+- **不改动原成品**：导出只 `pread` 原成品，不在服务端写任何镜像文件；
+- **内存与盘长无关**：按块生成，峰值内存 ≈ 读块大小 + 固定 40 KiB GPT 区。
+
+导出长度 = 分区结束字节 + 20480（备 GPT）。因此导出镜像不是原盘长度，
+而是“主 GPT 前缀 + 原样分区 + 紧邻的备 GPT”。
+
+**Range 与断点续传**：响应始终带 `Content-Length` 与 `Accept-Ranges: bytes`；
+单段 `Range: bytes=a-b` 返回 `206` + `Content-Range`，多段或无法解析的
+Range 按 RFC 9110 回退为整文件。因为导出字节流只由任务与分区号决定，
+**同一 URL 上多次单段 Range 下载逐段拼接后，与一次整盘下载逐字节相同**；
+`HEAD` 只回头部。
+
+**生命周期**：导出开始时固定住原成品的文件描述符。原成品被手动删除或
+TTL 到期后，**新的导出请求**返回 404，但**已开始的传输仍会传完**；任务
+目录在该传输结束后才真正删除。
+
+已知边界：
+
+- 只导出有类型 GUID 的分区；空表项不会出现在导出镜像里。
+- 若分区起点与新建主 GPT 保留区重叠则拒绝导出（正常成品不会出现）。
+- 不支持一次响应返回多个 Range 段（`multipart/byteranges`）。
 
 实现细节、校验顺序与实测数据见 [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)。
 
@@ -142,6 +181,10 @@ python3 -m pytest -q
 - 分区名按 UTF-16LE 解码；含无效代理项时用替换字符显示，但原始字节保留。
 - 单实例内存任务表：重启后未完成任务消失（目录会在 TTL 后清理），没有
   多副本共享的任务存储/队列。
-- 下载为普通整文件响应（支持 Range 由 Starlette 决定），未做断点续传保证。
+- 整盘下载为普通文件响应（Range 由 Starlette 提供）；单分区导出的 Range
+  一致性有专门的自动化测试。
+- 多段 Range（一次请求多个区间）未实现，返回整文件或单段。
+- 导出镜像在分区末尾立即写备 GPT，没有额外对齐填充；若某工具要求备 GPT
+  位于镜像最后 33 个 512 扇区，需要自行在导出后补齐。
 - 没有认证/限流；设计为内网工具，部署到公网前需加认证与配额。
 - 尚未在真实 4Kn 硬件/虚拟机启动环境中验证引导，只做了镜像级校验。
